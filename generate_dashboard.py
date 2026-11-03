@@ -2,23 +2,21 @@ import os
 import glob
 import csv
 import json
+import re
 from datetime import datetime
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-csv_files = sorted(glob.glob(os.path.join(script_dir, "player-growth-*.csv")))
+
+# 1. ONLY load daily CSV files (matches player-growth-YYYY-MM-DD.csv, IGNORES history.csv)
+all_csvs = glob.glob(os.path.join(script_dir, "player-growth-*.csv"))
+daily_csv_pattern = re.compile(r"player-growth-\d{4}-\d{2}-\d{2}\.csv$")
+csv_files = sorted([f for f in all_csvs if daily_csv_pattern.search(os.path.basename(f))])
 
 if not csv_files:
-    print("No CSV files found matching 'player-growth-*.csv'!")
+    print("No valid daily CSV files found matching 'player-growth-YYYY-MM-DD.csv'!")
     exit()
 
-print(f"Reading {len(csv_files)} files...")
-
-all_rows = []
-for fpath in csv_files:
-    with open(fpath, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            all_rows.append(row)
+print(f"Reading {len(csv_files)} clean daily files (ignored history files)...")
 
 def safe_float(val, default=0.0):
     try:
@@ -26,71 +24,87 @@ def safe_float(val, default=0.0):
     except (ValueError, TypeError):
         return default
 
-# 1. Identify Real Players (Plots Owned > 0 AND Total RC > 0)
+# 2. Read and DEDUPLICATE by (Player, Date)
+# Map: player -> date -> {eb, rc, rp, plots}
+player_timeline = {}
 real_players = set()
-for r in all_rows:
-    plots = safe_float(r.get("Plots Owned", 0))
-    rc = safe_float(r.get("Total RC", 0))
-    player = r.get("Player")
-    if plots > 0 and rc > 0 and player:
-        real_players.add(player)
+all_dates_set = set()
 
-# 2. Extract Individual Player Histories
+for fpath in csv_files:
+    with open(fpath, "r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            player = row.get("Player")
+            date = row.get("Date")
+            if not player or not date:
+                continue
+
+            # Support both "(EOD)" and non-EOD header variants
+            plots = int(safe_float(row.get("Plots Owned", 0)))
+            eb = round(safe_float(row.get("Total EB (EOD)") or row.get("Total EB", 0)), 2)
+            rc = round(safe_float(row.get("Total RC", 0)), 4)
+            rp = round(safe_float(row.get("Total RP (EOD)") or row.get("Total RP", 0)), 2)
+
+            if plots > 0 and rc > 0:
+                real_players.add(player)
+
+            if player not in player_timeline:
+                player_timeline[player] = {}
+
+            # Save / overwrite so duplicate days NEVER accumulate
+            player_timeline[player][date] = {
+                "plots": plots,
+                "eb": eb,
+                "rc": rc,
+                "rp": rp
+            }
+            all_dates_set.add(date)
+
+# 3. Sort dates chronologically
+sorted_all_dates = sorted(list(all_dates_set))
+
+# 4. Build clean sorted player histories
 players_data = {}
-for r in all_rows:
-    player = r.get("Player")
-    if player not in real_players:
-        continue
+for player in real_players:
+    p_dates = sorted(player_timeline[player].keys())
+    
+    eb_list = [player_timeline[player][d]["eb"] for d in p_dates]
+    rc_list = [player_timeline[player][d]["rc"] for d in p_dates]
+    rp_list = [player_timeline[player][d]["rp"] for d in p_dates]
+    plots_list = [player_timeline[player][d]["plots"] for d in p_dates]
+    latest_plots = plots_list[-1] if plots_list else 0
 
-    date = r.get("Date")
-    plots = int(safe_float(r.get("Plots Owned", 0)))
-    eb = round(safe_float(r.get("Total EB (EOD)", 0)), 2)
-    rc = round(safe_float(r.get("Total RC", 0)), 4)
-    rp = round(safe_float(r.get("Total RP (EOD)", 0)), 2)
-
-    if player not in players_data:
-        players_data[player] = {
-            "name": player,
-            "plots": plots,
-            "dates": [],
-            "eb": [],
-            "rc": [],
-            "rp": [],
-            "plots_history": []
-        }
-
-    p = players_data[player]
-    p["plots"] = plots
-    p["dates"].append(date)
-    p["eb"].append(eb)
-    p["rc"].append(rc)
-    p["rp"].append(rp)
-    p["plots_history"].append(plots)
+    players_data[player] = {
+        "name": player,
+        "plots": latest_plots,
+        "dates": p_dates,
+        "eb": eb_list,
+        "rc": rc_list,
+        "rp": rp_list,
+        "plots_history": plots_list
+    }
 
 sorted_players = sorted(players_data.items(), key=lambda x: x[1]["plots"], reverse=True)
 players_json = json.dumps(players_data)
 sorted_names_json = json.dumps([name for name, _ in sorted_players])
 
-# 3. Global Growth
-all_dates = sorted(list(set(r.get("Date") for r in all_rows if r.get("Date"))))
-
+# 5. Global Growth (Clean chronological cumulative)
 player_first_date = {}
 for name, p in players_data.items():
     player_first_date[name] = min(p["dates"])
 
-global_dates = all_dates
 daily_new_players = []
 cumulative_players = []
 running_total = 0
 
-for d in global_dates:
+for d in sorted_all_dates:
     new_count = sum(1 for name, f_date in player_first_date.items() if f_date == d)
     running_total += new_count
     daily_new_players.append(new_count)
     cumulative_players.append(running_total)
 
 global_data = {
-    "dates": global_dates,
+    "dates": sorted_all_dates,
     "total": cumulative_players,
     "new": daily_new_players,
     "latest_total": cumulative_players[-1] if cumulative_players else 0,
@@ -100,7 +114,7 @@ global_json = json.dumps(global_data)
 
 last_sync_time = datetime.now().strftime("%b %d, %Y - %I:%M %p")
 
-# 4. Generate HTML
+# 6. Generate Clean HTML
 html_template = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -388,4 +402,4 @@ output_path = os.path.join(script_dir, "index.html")
 with open(output_path, "w", encoding="utf-8") as f:
     f.write(html_template)
 
-print(f"\nDone! File created at: {output_path}")
+print(f"\nDone! Perfectly deduplicated index.html created at: {output_path}")
